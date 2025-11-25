@@ -1,6 +1,12 @@
-import type { Context } from "@netlify/functions";
+// netlify/functions/proxy.ts
 
-// Headers to block/filter so we don't confuse the browser or Google
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "*",
+};
+
+// Headers we do not want to forward to Google
 const HOP_BY_HOP_HEADERS = [
   "keep-alive",
   "transfer-encoding",
@@ -17,98 +23,97 @@ const HOP_BY_HOP_HEADERS = [
   "x-forwarded-proto"
 ];
 
-const CORS_HEADERS = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "*",
-};
-
-export default async (req: Request, context: Context) => {
+export default async (req: Request) => {
   const startTime = Date.now();
-  const reqUrl = new URL(req.url);
   
-  // --- LOGGING START ---
-  console.log(`[${new Date().toISOString()}] INCOMING REQUEST`);
-  console.log(`Method: ${req.method}`);
-  console.log(`Original URL: ${req.url}`);
-  console.log(`Pathname: ${reqUrl.pathname}`);
-  // --- LOGGING END ---
+  // DEBUGGING LOGS
+  console.log(`[${new Date().toISOString()}] Method: ${req.method} | URL: ${req.url}`);
 
   // 1. Handle Preflight (OPTIONS)
   if (req.method === "OPTIONS") {
-    console.log("Handling OPTIONS preflight request.");
     return new Response(null, { headers: CORS_HEADERS });
   }
 
-  // 2. Handle Connection Check (Root Path or Health Check)
-  // We log this specifically to debug if Cherry Studio is "Seeing" the server.
-  if (reqUrl.pathname === "/" || reqUrl.pathname === "" || (!reqUrl.pathname.includes("/v1") && !reqUrl.pathname.includes("/models"))) {
-     console.log("Root path detected. Sending 'Alive' message.");
-     return new Response(JSON.stringify({ status: "Alive", message: "Gemini Proxy Ready (Node.js)" }), {
-      headers: { ...CORS_HEADERS, "content-type": "application/json" },
-      status: 200
-    });
-  }
-
-  // 3. Build Target URL
-  // We strip the origin and point it to Google
-  const targetUrl = new URL(reqUrl.pathname + reqUrl.search, "https://generativelanguage.googleapis.com");
-  console.log(`Target URL Constructed: ${targetUrl.toString()}`);
-
-  // 4. Prepare Request Headers
-  const requestHeaders = new Headers();
-  req.headers.forEach((val, key) => {
-    if (!HOP_BY_HOP_HEADERS.includes(key.toLowerCase())) {
-      requestHeaders.set(key, val);
-    }
-  });
-  requestHeaders.set("Host", "generativelanguage.googleapis.com");
-  
-  // Log Headers (Masking API Key for security in logs)
-  const authHeader = requestHeaders.get("x-goog-api-key") || requestHeaders.get("authorization");
-  console.log("Request Headers being sent to Google:", {
-    ...Object.fromEntries(requestHeaders.entries()),
-    "x-goog-api-key": authHeader ? "(PRESENT - MASKED)" : "(MISSING)",
-    "authorization": authHeader ? "(PRESENT - MASKED)" : "(MISSING)"
-  });
-
   try {
+    const reqUrl = new URL(req.url);
+    
+    // 2. Health Check / Root Path Handling
+    // If the path is empty, root, or just checking availability
+    if (reqUrl.pathname === "/" || reqUrl.pathname === "" || reqUrl.pathname.endsWith("/proxy")) {
+       console.log("Health check detected.");
+       return new Response(JSON.stringify({ status: "Alive", message: "Gemini Proxy Ready" }), {
+        headers: { ...CORS_HEADERS, "content-type": "application/json" },
+        status: 200
+      });
+    }
+
+    // 3. Construct Target URL
+    // We assume the request is like: https://your-site.com/v1beta/models/...
+    // We want: https://generativelanguage.googleapis.com/v1beta/models/...
+    
+    // NOTE: When using netlify.toml rewrites, req.url might be the internal path.
+    // We extract the useful part of the path.
+    // We look for '/v1' or '/v1beta' to start the path mapping.
+    
+    let targetPath = reqUrl.pathname;
+    
+    // Fix for double slashes or internal netlify paths
+    if (targetPath.startsWith("/.netlify/functions/proxy")) {
+        // If the URL is the internal function path, we might be losing the original path.
+        // But usually, the client sends the full path.
+        // Let's try to extract the API version part.
+        const apiIndex = targetPath.indexOf("/v1");
+        if (apiIndex !== -1) {
+            targetPath = targetPath.substring(apiIndex);
+        }
+    }
+
+    const targetUrl = new URL(targetPath + reqUrl.search, "https://generativelanguage.googleapis.com");
+    console.log(`Proxying to: ${targetUrl.toString()}`);
+
+    // 4. Prepare Headers
+    const requestHeaders = new Headers();
+    req.headers.forEach((val, key) => {
+      if (!HOP_BY_HOP_HEADERS.includes(key.toLowerCase())) {
+        requestHeaders.set(key, val);
+      }
+    });
+    requestHeaders.set("Host", "generativelanguage.googleapis.com");
+
+    // 5. Prepare Fetch Options
     const fetchOptions: RequestInit = {
       method: req.method,
       headers: requestHeaders,
-      body: req.body, 
-      // @ts-ignore: Node 18+ duplex requirement for streaming bodies
-      duplex: 'half' 
     };
 
-    console.log("Sending fetch request to Google...");
+    // ONLY attach body if method is NOT GET/HEAD
+    // Attaching a body to GET causes Node to crash.
+    if (req.method !== "GET" && req.method !== "HEAD") {
+        if (req.body) {
+            fetchOptions.body = req.body;
+            // @ts-ignore: duplex is required for streaming bodies in Node 18+
+            fetchOptions.duplex = 'half'; 
+        }
+    }
 
-    // 5. Fetch from Google
+    // 6. Execute Request
     const response = await fetch(targetUrl, fetchOptions);
+    
+    console.log(`Google Response: ${response.status}`);
 
-    console.log(`Google Response Status: ${response.status} ${response.statusText}`);
-
-    // 6. Prepare Response Headers
-    const responseHeaders = new Headers({
-      ...CORS_HEADERS,
-    });
-
+    // 7. Handle Response Headers
+    const responseHeaders = new Headers({ ...CORS_HEADERS });
     response.headers.forEach((val, key) => {
       if (!HOP_BY_HOP_HEADERS.includes(key.toLowerCase())) {
         responseHeaders.set(key, val);
       }
     });
-    
-    // Ensure content-type is set
+
+    // Ensure content-type exists
     if (!responseHeaders.has("content-type")) {
-        const contentType = response.headers.get("content-type") || "application/json";
-        responseHeaders.set("content-type", contentType);
-        console.log(`Set default content-type: ${contentType}`);
+        responseHeaders.set("content-type", response.headers.get("content-type") || "application/json");
     }
 
-    console.log(`[${new Date().toISOString()}] Request Completed in ${Date.now() - startTime}ms`);
-
-    // 7. Return Response
     return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
@@ -116,16 +121,10 @@ export default async (req: Request, context: Context) => {
     });
 
   } catch (error) {
-    console.error("CRITICAL PROXY ERROR:", error);
-    return new Response(JSON.stringify({ error: String(error), details: "Check Netlify Function Logs" }), {
+    console.error("PROXY ERROR:", error);
+    return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...CORS_HEADERS, "content-type": "application/json" },
     });
   }
-};
-
-// Configure the function to use the standard Request/Response API
-// and handle all paths
-export const config = {
-  path: "/*"
 };
