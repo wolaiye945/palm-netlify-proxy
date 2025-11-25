@@ -6,7 +6,6 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Headers": "*",
 };
 
-// Headers we do not want to forward to Google
 const HOP_BY_HOP_HEADERS = [
   "keep-alive",
   "transfer-encoding",
@@ -24,8 +23,6 @@ const HOP_BY_HOP_HEADERS = [
 ];
 
 export default async (req: Request) => {
-  const startTime = Date.now();
-  
   // DEBUGGING LOGS
   console.log(`[${new Date().toISOString()}] Method: ${req.method} | URL: ${req.url}`);
 
@@ -38,7 +35,6 @@ export default async (req: Request) => {
     const reqUrl = new URL(req.url);
     
     // 2. Health Check / Root Path Handling
-    // If the path is empty, root, or just checking availability
     if (reqUrl.pathname === "/" || reqUrl.pathname === "" || reqUrl.pathname.endsWith("/proxy")) {
        console.log("Health check detected.");
        return new Response(JSON.stringify({ status: "Alive", message: "Gemini Proxy Ready" }), {
@@ -47,27 +43,26 @@ export default async (req: Request) => {
       });
     }
 
-    // 3. Construct Target URL
-    // We assume the request is like: https://your-site.com/v1beta/models/...
-    // We want: https://generativelanguage.googleapis.com/v1beta/models/...
-    
-    // NOTE: When using netlify.toml rewrites, req.url might be the internal path.
-    // We extract the useful part of the path.
-    // We look for '/v1' or '/v1beta' to start the path mapping.
-    
+    // 3. Construct Target URL with INTELLIGENT PATH FIXING
     let targetPath = reqUrl.pathname;
     
-    // Fix for double slashes or internal netlify paths
+    // Clean up internal Netlify paths if they appear
     if (targetPath.startsWith("/.netlify/functions/proxy")) {
-        // If the URL is the internal function path, we might be losing the original path.
-        // But usually, the client sends the full path.
-        // Let's try to extract the API version part.
-        const apiIndex = targetPath.indexOf("/v1");
-        if (apiIndex !== -1) {
-            targetPath = targetPath.substring(apiIndex);
-        }
+        targetPath = targetPath.replace("/.netlify/functions/proxy", "");
     }
 
+    // CRITICAL FIX: Check if the path is missing the API version
+    // If it starts directly with "/models", we assume it needs "/v1beta" prepended.
+    if (targetPath.startsWith("/models")) {
+        console.log(`Path missing version detected: ${targetPath}. Prepending /v1beta`);
+        targetPath = "/v1beta" + targetPath;
+    } else if (targetPath.startsWith("/v1/")) {
+        // Optional: Normalize v1 to v1beta if you want to force beta features, 
+        // but usually v1 is fine if Google supports it.
+        // keeping as is for now unless you want to force v1beta everywhere.
+    }
+
+    // Combine with query params (like ?alt=sse)
     const targetUrl = new URL(targetPath + reqUrl.search, "https://generativelanguage.googleapis.com");
     console.log(`Proxying to: ${targetUrl.toString()}`);
 
@@ -86,8 +81,6 @@ export default async (req: Request) => {
       headers: requestHeaders,
     };
 
-    // ONLY attach body if method is NOT GET/HEAD
-    // Attaching a body to GET causes Node to crash.
     if (req.method !== "GET" && req.method !== "HEAD") {
         if (req.body) {
             fetchOptions.body = req.body;
@@ -99,7 +92,7 @@ export default async (req: Request) => {
     // 6. Execute Request
     const response = await fetch(targetUrl, fetchOptions);
     
-    console.log(`Google Response: ${response.status}`);
+    console.log(`Google Response: ${response.status} ${response.statusText}`);
 
     // 7. Handle Response Headers
     const responseHeaders = new Headers({ ...CORS_HEADERS });
@@ -109,7 +102,6 @@ export default async (req: Request) => {
       }
     });
 
-    // Ensure content-type exists
     if (!responseHeaders.has("content-type")) {
         responseHeaders.set("content-type", response.headers.get("content-type") || "application/json");
     }
