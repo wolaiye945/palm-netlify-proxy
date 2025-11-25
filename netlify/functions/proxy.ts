@@ -21,6 +21,7 @@ const CORS_HEADERS: Record<string, string> = {
 
 export default async (request: Request, context: Context) => {
 
+  // 1. Handle Preflight Options
   if (request.method === "OPTIONS") {
     return new Response(null, {
       headers: CORS_HEADERS,
@@ -28,23 +29,19 @@ export default async (request: Request, context: Context) => {
   }
 
   const { pathname, searchParams } = new URL(request.url);
+
+  // 2. Handle Root/Info Page
   if(pathname === "/") {
     let blank_html = `
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Google PaLM API proxy on Netlify Edge</title>
+  <title>Gemini/PaLM API Proxy</title>
 </head>
 <body>
-  <h1 id="google-palm-api-proxy-on-netlify-edge">Google PaLM API proxy on Netlify Edge</h1>
-  <p>Tips: This project uses a reverse proxy to solve problems such as location restrictions in Google APIs. </p>
-  <p>If you have any of the following requirements, you may need the support of this project.</p>
-  <ol>
-  <li>When you see the error message &quot;User location is not supported for the API use&quot; when calling the Google PaLM API</li>
-  <li>You want to customize the Google PaLM API</li>
-  </ol>
-  <p>For technical discussions, please visit <a href="https://simonmy.com/posts/google-palm-api-proxy-on-netlify-edge.html">https://simonmy.com/posts/google-palm-api-proxy-on-netlify-edge.html</a></p>
+  <h1>Gemini API Proxy Active</h1>
+  <p>Status: Running on Netlify Edge</p>
 </body>
 </html>
     `
@@ -56,6 +53,8 @@ export default async (request: Request, context: Context) => {
     });
   }
 
+  // 3. Construct Target URL
+  // Note: Using 'generativelanguage.googleapis.com' is correct for Gemini
   const url = new URL(pathname, "https://generativelanguage.googleapis.com");
   searchParams.delete("_path");
 
@@ -63,22 +62,76 @@ export default async (request: Request, context: Context) => {
     url.searchParams.append(key, value);
   });
 
-  const headers = pickHeaders(request.headers, ["content-type", "authorization", "x-goog-api-client", "x-goog-api-key", "accept-encoding"]);
+  // 4. Prepare Request Headers
+  // We explicitly forward the API Key and Client headers. 
+  // We DO NOT forward 'host' or 'content-length' to let fetch handle those.
+  const requestHeaders = pickHeaders(request.headers, [
+    "content-type", 
+    "authorization", 
+    "x-goog-api-client", 
+    "x-goog-api-key", 
+    "accept-encoding" // Important: Let Google know if we accept gzip, though Netlify handles decoding usually.
+  ]);
 
-  const response = await fetch(url, {
-    body: request.body,
-    method: request.method,
-    headers,
-    duplex: "half"
-  });
+  try {
+    // 5. Fetch from Google
+    // 'duplex' is required for streaming bodies in some environments, but standard fetch often implies it.
+    // If 'duplex: half' was causing issues, removing it usually defaults to standard behavior.
+    // However, for Node 18+ native fetch, duplex: 'half' is often required if sending a body. 
+    // We will keep it but ensure body handling is robust.
+    
+    // Check if we have a body to forward
+    const fetchOptions: RequestInit = {
+        method: request.method,
+        headers: requestHeaders,
+    };
 
-  const responseHeaders = {
-    ...CORS_HEADERS,
-    ...Object.fromEntries(response.headers),
-  };
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+        fetchOptions.body = request.body;
+        // @ts-ignore - Netlify Edge uses Deno-style fetch where duplex might be needed
+        fetchOptions.duplex = "half"; 
+    }
 
-  return new Response(response.body, {
-    headers: responseHeaders,
-    status: response.status
-  });
+    const response = await fetch(url, fetchOptions);
+
+    // 6. Handle Response Headers
+    // CRITICAL FIX: Do not forward 'content-encoding' or 'transfer-encoding'. 
+    // Netlify's edge layer acts as a middleman. If Google sends back gzipped data, 
+    // Netlify decodes it. If we tell the client "this is gzipped" via headers but pass 
+    // decoded text, the client breaks.
+    
+    const responseHeaders = new Headers(CORS_HEADERS);
+    
+    // Forward specific safe headers
+    const safeResponseHeaders = [
+        "content-type",
+        "cache-control",
+        "date",
+        "server",
+        "vary"
+    ];
+
+    safeResponseHeaders.forEach(key => {
+        const val = response.headers.get(key);
+        if(val) responseHeaders.set(key, val);
+    });
+
+    // 7. Return Response
+    // We pass response.body directly to support streaming
+    return new Response(response.body, {
+      headers: responseHeaders,
+      status: response.status,
+      statusText: response.statusText
+    });
+
+  } catch (error) {
+    // Error handling
+    return new Response(JSON.stringify({ error: String(error) }), {
+      status: 500,
+      headers: { 
+          ...CORS_HEADERS,
+          "content-type": "application/json"
+      }
+    });
+  }
 };
