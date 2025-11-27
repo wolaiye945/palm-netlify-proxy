@@ -1,7 +1,7 @@
 [build]
   ignore = "exit 1"
-[[redirects]]
-  from = "/*"
-  to = "/.netlify/functions/proxy"
-  status = 200
-  force = true
+
+# Route everything to the edge function
+[[edge_functions]]
+  function = "proxy"
+  path = "/*"
