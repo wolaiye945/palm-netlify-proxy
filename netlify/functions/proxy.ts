@@ -23,10 +23,9 @@ const HOP_BY_HOP_HEADERS = [
 ];
 
 export default async (req: Request) => {
-  // DEBUGGING LOGS
-  console.log(`[${new Date().toISOString()}] Method: ${req.method} | URL: ${req.url}`);
+  const reqId = Math.random().toString(36).substring(7); // Random ID to track requests in logs
+  console.log(`[${reqId}] Request Started: ${req.method} ${req.url}`);
 
-  // 1. Handle Preflight (OPTIONS)
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: CORS_HEADERS });
   }
@@ -34,39 +33,21 @@ export default async (req: Request) => {
   try {
     const reqUrl = new URL(req.url);
     
-    // 2. Health Check / Root Path Handling
-    if (reqUrl.pathname === "/" || reqUrl.pathname === "" || reqUrl.pathname.endsWith("/proxy")) {
-       console.log("Health check detected.");
-       return new Response(JSON.stringify({ status: "Alive", message: "Gemini Proxy Ready" }), {
-        headers: { ...CORS_HEADERS, "content-type": "application/json" },
-        status: 200
-      });
-    }
-
-    // 3. Construct Target URL with INTELLIGENT PATH FIXING
+    // --- PATH CORRECTION LOGIC ---
     let targetPath = reqUrl.pathname;
-    
-    // Clean up internal Netlify paths if they appear
     if (targetPath.startsWith("/.netlify/functions/proxy")) {
         targetPath = targetPath.replace("/.netlify/functions/proxy", "");
     }
-
-    // CRITICAL FIX: Check if the path is missing the API version
-    // If it starts directly with "/models", we assume it needs "/v1beta" prepended.
+    // Fix missing version
     if (targetPath.startsWith("/models")) {
-        console.log(`Path missing version detected: ${targetPath}. Prepending /v1beta`);
+        console.log(`[${reqId}] Fix: Prepending /v1beta to path`);
         targetPath = "/v1beta" + targetPath;
-    } else if (targetPath.startsWith("/v1/")) {
-        // Optional: Normalize v1 to v1beta if you want to force beta features, 
-        // but usually v1 is fine if Google supports it.
-        // keeping as is for now unless you want to force v1beta everywhere.
     }
-
-    // Combine with query params (like ?alt=sse)
+    
     const targetUrl = new URL(targetPath + reqUrl.search, "https://generativelanguage.googleapis.com");
-    console.log(`Proxying to: ${targetUrl.toString()}`);
+    console.log(`[${reqId}] Proxy Target: ${targetUrl.toString()}`);
 
-    // 4. Prepare Headers
+    // --- HEADER PREPARATION ---
     const requestHeaders = new Headers();
     req.headers.forEach((val, key) => {
       if (!HOP_BY_HOP_HEADERS.includes(key.toLowerCase())) {
@@ -75,26 +56,24 @@ export default async (req: Request) => {
     });
     requestHeaders.set("Host", "generativelanguage.googleapis.com");
 
-    // 5. Prepare Fetch Options
     const fetchOptions: RequestInit = {
       method: req.method,
       headers: requestHeaders,
     };
 
-    if (req.method !== "GET" && req.method !== "HEAD") {
-        if (req.body) {
-            fetchOptions.body = req.body;
-            // @ts-ignore: duplex is required for streaming bodies in Node 18+
-            fetchOptions.duplex = 'half'; 
-        }
+    if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
+        fetchOptions.body = req.body;
+        // @ts-ignore: Node 18+ requirement
+        fetchOptions.duplex = 'half'; 
     }
 
-    // 6. Execute Request
+    // --- SEND TO GOOGLE ---
+    const startTime = Date.now();
     const response = await fetch(targetUrl, fetchOptions);
     
-    console.log(`Google Response: ${response.status} ${response.statusText}`);
+    console.log(`[${reqId}] Google Status: ${response.status}`);
 
-    // 7. Handle Response Headers
+    // --- RESPONSE HANDLING ---
     const responseHeaders = new Headers({ ...CORS_HEADERS });
     response.headers.forEach((val, key) => {
       if (!HOP_BY_HOP_HEADERS.includes(key.toLowerCase())) {
@@ -102,18 +81,56 @@ export default async (req: Request) => {
       }
     });
 
+    // Force headers to prevent buffering and timeouts if possible
+    responseHeaders.set("Cache-Control", "no-cache");
+    responseHeaders.set("X-Accel-Buffering", "no"); // Nginx hint
     if (!responseHeaders.has("content-type")) {
-        responseHeaders.set("content-type", response.headers.get("content-type") || "application/json");
+      responseHeaders.set("content-type", response.headers.get("content-type") || "application/json");
     }
 
-    return new Response(response.body, {
+    // --- STREAM DEBUGGING MONITOR ---
+    // We create a TransformStream to count chunks passing through without modifying them.
+    // This helps us see if the stream dies in the middle.
+    let chunkCount = 0;
+    let byteCount = 0;
+
+    const { readable, writable } = new TransformStream({
+      transform(chunk, controller) {
+        chunkCount++;
+        byteCount += chunk.length;
+        // Log every 20 chunks to avoid flooding logs, but show activity
+        if (chunkCount % 20 === 0) {
+            console.log(`[${reqId}] Stream active: ${chunkCount} chunks, ${byteCount} bytes...`);
+        }
+        controller.enqueue(chunk);
+      },
+      flush() {
+        const duration = Date.now() - startTime;
+        console.log(`[${reqId}] Stream COMPLETE. Total: ${chunkCount} chunks, ${byteCount} bytes. Duration: ${duration}ms`);
+        if (duration > 9500) {
+             console.warn(`[${reqId}] WARNING: Duration close to Netlify 10s limit!`);
+        }
+      }
+    });
+
+    // If response has a body, pipe it through our monitor
+    let finalBody = response.body;
+    if (response.body) {
+        // @ts-ignore
+        response.body.pipeTo(writable).catch(err => {
+            console.error(`[${reqId}] Stream Broken/Interrupted:`, err);
+        });
+        finalBody = readable;
+    }
+
+    return new Response(finalBody, {
       status: response.status,
       statusText: response.statusText,
       headers: responseHeaders,
     });
 
   } catch (error) {
-    console.error("PROXY ERROR:", error);
+    console.error(`[${reqId}] CRITICAL ERROR:`, error);
     return new Response(JSON.stringify({ error: String(error) }), {
       status: 500,
       headers: { ...CORS_HEADERS, "content-type": "application/json" },
